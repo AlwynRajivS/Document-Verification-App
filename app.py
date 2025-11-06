@@ -1,105 +1,195 @@
 import streamlit as st
 import pandas as pd
 import pdfplumber
-import io
 import re
+import io
 
-st.set_page_config(page_title="Dynamic Excel vs PDF Comparator", layout="wide")
-st.title("Excel vs PDF/Text Comparator")
+# ---------------- HEADER MAPPING ----------------
+HEADER_MAP = {
+    "EXAM": "EXAM",
+    "PROGRAMME": "PROGRAMME",
+    "REGISTER NO": "REGISTER_NO",
+    "STUDENT NAME": "NAME",
+    "SEM": "SEM_NO",
+    "SUBJECT ORDER": "SUB_ORDER",
+    "SUB CODE": "SUB_CODE",
+    "SUBJECT NAME": "SUBJECT_NAME",
+    "INT": "INT",
+    "EXT": "EXT",
+    "TOT": "TOTAL",
+    "RESULT": "RESULT",
+    "GRADE": "GRADE",
+    "GRADE POINT": "GRADE_POINT"
+}
+
+# ---------------- PDF PARSER ----------------
+def extract_pdf_data(pdf_bytes):
+    """Extracts structured student data from PDF text."""
+    text_data = ""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text_data += (page.extract_text() or "") + "\n"
+
+    text_data = re.sub(r"\s+", " ", text_data.strip())
+    records = []
+
+    # Split PDF by student blocks
+    for block in re.split(r"\*{3}\s*END OF STATEMENT\s*\*{3}", text_data, flags=re.I):
+        reg_match = re.search(r"REGISTER\s*NO\.?\s*:?[\s]*([0-9]+)", block, flags=re.I)
+        if not reg_match:
+            continue
+        regno = reg_match.group(1).strip()
+
+        # Extract subject info lines
+        for line in re.split(r"(?=\d{1,2}\s+[A-Z]{2,3}\d{4})", block):
+            m = re.search(
+                r"^\s*\d+\s+([A-Z]{2,3}\d{4})\s+(.+?)\s+(\d+(?:\.\d+)?)\s+([A-Z\+OU]{1,2})\s+(\d+)\s+(PASS|RA)",
+                line.strip(), flags=re.I
+            )
+            if m:
+                records.append({
+                    "REGISTER_NO": regno,
+                    "SUB_CODE": m.group(1).strip().upper(),
+                    "SUBJECT_NAME": m.group(2).strip(),
+                    "COURSE_CREDIT": m.group(3).strip(),
+                    "GRADE": m.group(4).strip().upper(),
+                    "GRADE_POINT": m.group(5).strip(),
+                    "RESULT": m.group(6).strip().upper(),
+                })
+    return pd.DataFrame(records)
+
+
+# ---------------- RESULT NORMALIZATION ----------------
+def normalize_result(value):
+    """Convert result abbreviations to a common form for comparison."""
+    v = str(value).strip().upper()
+    if v == "F":
+        return "RA"
+    elif v == "P":
+        return "PASS"
+    return v
+
+
+# ---------------- STREAMLIT APP ----------------
+st.set_page_config(page_title="Excel vs PDF Comparator", layout="wide")
+st.title("Excel vs PDF Comparator (with Missing Record Detection)")
+
 st.markdown("""
-Upload any **Excel file** (master data) and **PDF/Text file** (to verify).  
-This tool automatically converts the PDF to text and compares **only the columns you select**.
+This tool compares **Excel master data** and **multi-student PDF marksheets**,  
+maps results and detects missing or extra records.
 """)
 
-# ---------- File Upload ----------
+# ---------------- FILE UPLOAD ----------------
 excel_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
-pdf_file = st.file_uploader("Upload PDF or Text File", type=["pdf", "txt"])
+pdf_file = st.file_uploader("Upload PDF File", type=["pdf"])
 
-if excel_file:
+if excel_file and pdf_file:
     try:
         # ---------- STEP 1: Load Excel ----------
         df_excel = pd.read_excel(excel_file)
-        df_excel.columns = [str(c).strip().upper().replace("\n", " ").replace("  ", " ") for c in df_excel.columns]
-        df_excel = df_excel.astype(str).apply(lambda x: x.str.strip())
-
+        df_excel.columns = [str(c).strip().upper() for c in df_excel.columns]
         st.success("Excel file loaded successfully.")
 
-        # ---------- STEP 2: Select Headers ----------
-        st.markdown("### Select Columns to Compare")
-        selected_cols = st.multiselect(
-            "Select one or more columns from Excel to check in PDF/Text file:",
-            options=list(df_excel.columns),
-            default=list(df_excel.columns)
-        )
+        # Map headers
+        mapped_cols = {}
+        for col in df_excel.columns:
+            clean_col = col.strip().upper()
+            if clean_col in HEADER_MAP:
+                mapped_cols[col] = HEADER_MAP[clean_col]
+        df_excel.rename(columns=mapped_cols, inplace=True)
+        df_excel = df_excel.astype(str).apply(lambda x: x.str.strip())
 
-        if not selected_cols:
-            st.warning("Please select at least one column to compare.")
+        # Normalize Excel 'RESULT' column
+        if "RESULT" in df_excel.columns:
+            df_excel["RESULT"] = df_excel["RESULT"].apply(normalize_result)
+
+        st.subheader("Excel Data")
+        st.dataframe(df_excel.head())
+
+        # Check required columns
+        required_cols = ["REGISTER_NO", "SUB_CODE", "SUBJECT_NAME", "GRADE", "GRADE_POINT", "RESULT"]
+        missing = [c for c in required_cols if c not in df_excel.columns]
+        if missing:
+            st.warning(f"Missing columns in Excel after mapping: {missing}")
+
+        # ---------- STEP 2: Parse PDF ----------
+        st.info("Extracting structured data from PDF...")
+        pdf_bytes = pdf_file.read()
+        df_pdf = extract_pdf_data(pdf_bytes)
+
+        if df_pdf.empty:
+            st.error("No valid course data extracted from PDF. Please verify the PDF format.")
             st.stop()
 
-        # ---------- STEP 3: Upload and Extract PDF ----------
-        if pdf_file:
-            if pdf_file.name.lower().endswith(".pdf"):
-                pdf_text = ""
-                with pdfplumber.open(pdf_file) as pdf:
-                    for page in pdf.pages:
-                        pdf_text += (page.extract_text() or "") + "\n"
-                if not pdf_text.strip():
-                    st.error("No text extracted from PDF. Try uploading a text version of the file.")
-                    st.stop()
-            else:
-                pdf_text = pdf_file.read().decode("utf-8", errors="ignore")
+        st.success(f"Extracted {len(df_pdf)} subject records from PDF.")
+        st.dataframe(df_pdf.head())
 
-            # Clean and standardize PDF text
-            pdf_text = re.sub(r'\s+', ' ', pdf_text.strip()).upper()
+        # Normalize PDF 'RESULT' column
+        df_pdf["RESULT"] = df_pdf["RESULT"].apply(normalize_result)
 
-            # ---------- STEP 4: Compare Dynamically ----------
-            st.info("Comparing selected Excel columns with PDF/Text content...")
+        # ---------- STEP 3: Merge and Compare ----------
+        merged = pd.merge(
+            df_excel, df_pdf,
+            on=["REGISTER_NO", "SUB_CODE"],
+            how="inner",
+            suffixes=("_EXCEL", "_PDF")
+        )
 
-            mismatches = []
-            total_checked = 0
+        compare_cols = ["SUBJECT_NAME", "GRADE", "GRADE_POINT", "RESULT"]
 
-            for idx, row in df_excel.iterrows():
-                missing_fields = {}
-                found_all = True
+        mismatches = merged[
+            merged.apply(
+                lambda row: any(
+                    str(row.get(f"{col}_EXCEL", "")).strip().upper() !=
+                    str(row.get(f"{col}_PDF", "")).strip().upper()
+                    for col in compare_cols if f"{col}_PDF" in merged.columns
+                ),
+                axis=1
+            )
+        ]
 
-                for col_name in selected_cols:
-                    value_str = str(row[col_name]).strip().upper()
-                    if not value_str or value_str in ["NAN", "NONE"]:
-                        continue
+        # ---------- STEP 4: Missing Record Detection ----------
+        excel_keys = df_excel[["REGISTER_NO", "SUB_CODE"]].drop_duplicates()
+        pdf_keys = df_pdf[["REGISTER_NO", "SUB_CODE"]].drop_duplicates()
 
-                    total_checked += 1
-                    if value_str not in pdf_text:
-                        found_all = False
-                        missing_fields[col_name] = value_str
+        missing_in_pdf = pd.merge(excel_keys, pdf_keys, on=["REGISTER_NO", "SUB_CODE"], how="left", indicator=True)
+        missing_in_pdf = missing_in_pdf[missing_in_pdf["_merge"] == "left_only"].drop(columns=["_merge"])
 
-                if not found_all:
-                    mismatch_info = {"ROW_INDEX": idx + 1}
-                    mismatch_info.update(missing_fields)
-                    mismatches.append(mismatch_info)
+        missing_in_excel = pd.merge(pdf_keys, excel_keys, on=["REGISTER_NO", "SUB_CODE"], how="left", indicator=True)
+        missing_in_excel = missing_in_excel[missing_in_excel["_merge"] == "left_only"].drop(columns=["_merge"])
 
-            # ---------- STEP 5: Display Results ----------
-            if not mismatches:
-                st.success(f"All {total_checked} selected data values were found in the PDF/Text. No mismatches detected.")
-            else:
-                mismatch_df = pd.DataFrame(mismatches)
-                st.warning(f"Found {len(mismatch_df)} rows with missing or mismatched data in the PDF/Text.")
-                st.dataframe(mismatch_df)
+        # ---------- STEP 5: Display Results ----------
+        st.subheader("Comparison Result")
 
-                # Allow download
-                csv_buffer = io.StringIO()
-                mismatch_df.to_csv(csv_buffer, index=False)
-                st.download_button(
-                    label="Download Mismatch Report (CSV)",
-                    data=csv_buffer.getvalue(),
-                    file_name="mismatched_data.csv",
-                    mime="text/csv"
-                )
-
+        if mismatches.empty and missing_in_pdf.empty and missing_in_excel.empty:
+            st.success("All records match perfectly! No mismatches or missing records found.")
         else:
-            st.info("Please upload a PDF or Text file to start comparison.")
+            if not mismatches.empty:
+                st.error(f"{len(mismatches)} mismatched rows detected!")
+                st.dataframe(mismatches)
+                csv_buf = io.StringIO()
+                mismatches.to_csv(csv_buf, index=False)
+                st.download_button("Download Mismatch Report (CSV)", csv_buf.getvalue(),
+                                   file_name="mismatch_report.csv", mime="text/csv")
+
+            if not missing_in_pdf.empty:
+                st.warning(f"{len(missing_in_pdf)} records missing in PDF.")
+                st.dataframe(missing_in_pdf)
+                csv_buf2 = io.StringIO()
+                missing_in_pdf.to_csv(csv_buf2, index=False)
+                st.download_button("Download Missing in PDF (CSV)", csv_buf2.getvalue(),
+                                   file_name="missing_in_pdf.csv", mime="text/csv")
+
+            if not missing_in_excel.empty:
+                st.warning(f"{len(missing_in_excel)} extra records found in PDF (not in Excel).")
+                st.dataframe(missing_in_excel)
+                csv_buf3 = io.StringIO()
+                missing_in_excel.to_csv(csv_buf3, index=False)
+                st.download_button("Download Extra in PDF (CSV)", csv_buf3.getvalue(),
+                                   file_name="extra_in_pdf.csv", mime="text/csv")
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error during processing: {e}")
 
 else:
-    st.info("Please upload both Excel and PDF/Text files to start.")
+    st.info("Please upload both Excel and PDF files to start comparison.")
