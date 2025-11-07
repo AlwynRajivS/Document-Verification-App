@@ -34,7 +34,7 @@ def extract_pdf_data(pdf_bytes):
     records = []
 
     # Split PDF by student blocks
-    for block in re.split(r"\*{3}\s*END OF STATEMENT\s*\*{3}", text_data, flags=re.I):
+    for block in re.split(r"Credits\s+Registered", text_data, flags=re.I):
         reg_match = re.search(r"REGISTER\s*NO\.?\s*:?[\s]*([0-9]+)", block, flags=re.I)
         if not reg_match:
             continue
@@ -193,3 +193,4 @@ if excel_file and pdf_file:
 
 else:
     st.info("Please upload both Excel and PDF files to start comparison.")
+
